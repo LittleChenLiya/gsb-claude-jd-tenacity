@@ -56,6 +56,16 @@ Those functions can be used as the `sleep` keyword argument of
 .. automodule:: tenacity.nap
    :members:
 
+Attempt Quota
+-------------
+
+Those classes can be used as the `attempt_quota` keyword argument of
+:py:func:`tenacity.retry` to share one budget of function executions
+between several retrying objects.
+
+.. automodule:: tenacity.quota
+   :members:
+
 Retry Functions
 ---------------
 

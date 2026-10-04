@@ -1,0 +1,12 @@
+---
+features:
+  - |
+    Add ``tenacity.AttemptQuota``, an explicit shared budget of function
+    executions that can be passed to any retrying object (sync or async)
+    via the new ``attempt_quota`` keyword argument. Every attempt
+    atomically acquires one token before the ``before`` callbacks and the
+    wrapped function run; when the quota is exhausted the call fails fast
+    with the dedicated terminal error ``tenacity.AttemptQuotaExhausted``
+    instead of sleeping and retrying again. The quota is never refilled
+    or reset automatically, and retrying objects created without
+    ``attempt_quota`` behave exactly as before.

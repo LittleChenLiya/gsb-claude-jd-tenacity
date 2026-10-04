@@ -40,6 +40,9 @@ from .before_sleep import before_sleep_log, before_sleep_nothing
 # Import all nap strategies for easier usage.
 from .nap import sleep, sleep_using_event
 
+# Import the shared attempt quota primitives.
+from .quota import AttemptQuota, AttemptQuotaExhausted
+
 # Import all built-in retry strategies for easier usage.
 from .retry import (
     retry_all,
@@ -261,6 +264,7 @@ class BaseRetrying(ABC):
         retry_error_callback: t.Callable[["RetryCallState"], t.Any] | None = None,
         name: str | None = None,
         enabled: bool = True,
+        attempt_quota: "AttemptQuota | None" = None,
     ) -> None:
         self.sleep = sleep
         self.stop = stop
@@ -275,6 +279,7 @@ class BaseRetrying(ABC):
         self.retry_error_callback = retry_error_callback
         self._name = name
         self.enabled = enabled
+        self.attempt_quota = attempt_quota
 
     def copy(
         self,
@@ -292,6 +297,7 @@ class BaseRetrying(ABC):
         | None = _unset,
         name: str | object | None = _unset,
         enabled: bool | object = _unset,
+        attempt_quota: "AttemptQuota | object | None" = _unset,
     ) -> "Self":
         """Copy this object with some parameters changed if needed."""
         return self.__class__(
@@ -309,6 +315,7 @@ class BaseRetrying(ABC):
             ),
             name=_first_set(name, self._name),
             enabled=_first_set(enabled, self.enabled),
+            attempt_quota=_first_set(attempt_quota, self.attempt_quota),
         )
 
     # No @override: object.__getstate__ only exists from Python 3.11 on.
@@ -431,6 +438,20 @@ class BaseRetrying(ABC):
         self.statistics["delay_since_first_attempt"] = retry_state.seconds_since_start
         self.iter_state.stop_run_result = self.stop(retry_state)
 
+    def _acquire_attempt_quota(self, retry_state: "RetryCallState") -> None:
+        # Runs as the very first action of an attempt, before `before`
+        # callbacks and before the wrapped function. Raising here propagates
+        # straight out of the retrying call (it is never recorded as the
+        # attempt outcome), so an exhausted quota terminates the call without
+        # executing the `before` callbacks or the function.
+        quota = self.attempt_quota
+        if quota is not None and not quota.acquire():
+            raise AttemptQuotaExhausted(
+                f"shared attempt quota exhausted "
+                f"(limit={quota.limit}) before attempt "
+                f"#{retry_state.attempt_number} of {retry_state.get_fn_name()}"
+            )
+
     def iter(self, retry_state: "RetryCallState") -> DoAttempt | DoSleep | t.Any:
         self._begin_iter(retry_state)
         result = None
@@ -443,6 +464,8 @@ class BaseRetrying(ABC):
 
         fut = retry_state.outcome
         if fut is None:
+            if self.attempt_quota is not None:
+                self._add_action_func(self._acquire_attempt_quota)
             if self.before is not None:
                 self._add_action_func(self.before)
             self._add_action_func(lambda rs: DoAttempt())
@@ -747,6 +770,7 @@ def retry(
     retry_error_callback: t.Callable[["RetryCallState"], t.Any | t.Awaitable[t.Any]]
     | None = ...,
     enabled: bool = ...,
+    attempt_quota: "AttemptQuota | None" = ...,
 ) -> _AsyncRetryDecorator: ...
 
 
@@ -765,6 +789,7 @@ def retry(
     retry_error_callback: t.Callable[["RetryCallState"], t.Any | t.Awaitable[t.Any]]
     | None = None,
     enabled: bool = True,
+    attempt_quota: "AttemptQuota | None" = None,
 ) -> t.Callable[[t.Callable[P, R]], _RetryDecorated[P, R]]: ...
 
 
@@ -815,6 +840,8 @@ __all__ = [
     "NO_RESULT",
     "AsyncRetrying",
     "AttemptManager",
+    "AttemptQuota",
+    "AttemptQuotaExhausted",
     "BaseAction",
     "BaseRetrying",
     "DoAttempt",

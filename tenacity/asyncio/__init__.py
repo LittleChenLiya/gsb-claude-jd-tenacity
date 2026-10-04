@@ -93,6 +93,7 @@ class AsyncRetrying(BaseRetrying):
         | None = None,
         name: str | None = None,
         enabled: bool = True,
+        attempt_quota: "tenacity.AttemptQuota | None" = None,
     ) -> None:
         super().__init__(
             sleep=sleep,  # type: ignore[arg-type]
@@ -107,6 +108,7 @@ class AsyncRetrying(BaseRetrying):
             retry_error_callback=retry_error_callback,
             name=name,
             enabled=enabled,
+            attempt_quota=attempt_quota,
         )
 
     @override
@@ -139,6 +141,15 @@ class AsyncRetrying(BaseRetrying):
                 await self.sleep(do)  # type: ignore[misc]
             else:
                 return do  # type: ignore[no-any-return]
+
+    @override
+    async def _acquire_attempt_quota(self, retry_state: "RetryCallState") -> None:  # type: ignore[override]
+        # Checkpoint: yield to the event loop once so that a cancellation
+        # requested before this point is delivered *before* a token is
+        # taken. Calls cancelled prior to acquisition therefore never
+        # consume quota.
+        await _portable_async_sleep(0)
+        super()._acquire_attempt_quota(retry_state)
 
     @override
     def _add_action_func(self, fn: t.Callable[..., t.Any]) -> None:

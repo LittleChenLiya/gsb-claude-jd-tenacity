@@ -764,6 +764,60 @@ factory function instead:
 
     process(my_generator)  # each retry gets a fresh generator
 
+Shared attempt quota
+~~~~~~~~~~~~~~~~~~~~
+
+Several retrying objects -- sync and async alike -- can share one explicit
+budget of *function executions* by passing the same
+``tenacity.AttemptQuota`` instance as ``attempt_quota``. The quota limits
+how many times the wrapped functions are actually executed across all of
+the retry loops that share it, not the sum of their individual retry
+counts.
+
+.. code-block:: python
+
+    from tenacity import AttemptQuota, AttemptQuotaExhausted, retry, stop_never
+
+    quota = AttemptQuota(3)  # 3 executions in total, shared by every user
+
+    @retry(stop=stop_never, attempt_quota=quota)
+    def flaky_a():
+        ...
+
+    @retry(stop=stop_never, attempt_quota=quota)
+    def flaky_b():
+        ...
+
+Acquisition timing
+------------------
+
+One token is acquired atomically (under a lock, so threads and coroutines
+cannot overdraw) at the very start of every attempt, *before* the
+``before`` callbacks and *before* the wrapped function runs. A token is
+consumed whether the attempt succeeds or fails. Because acquisition
+happens first, an attempt that is denied a token never runs the ``before``
+callbacks or the function. In async retry loops a cancellation checkpoint
+is observed just before acquisition, so a call that was cancelled before
+reaching the acquisition point never consumes a token.
+
+Exhaustion protocol
+-------------------
+
+When no token is left, the call raises ``tenacity.AttemptQuotaExhausted``
+immediately instead of sleeping and looping again. This is a dedicated
+terminal error: it is raised directly out of the retrying call, is never
+recorded as the attempt outcome, never triggers another retry, and is
+never wrapped in ``RetryError`` (even with ``reraise=True``). The quota is
+not replenished on a timer and never resets automatically; once exhausted,
+every further attempt through any retrying object sharing it fails fast
+with ``AttemptQuotaExhausted`` until the caller swaps in a fresh
+``AttemptQuota``.
+
+The quota state lives entirely in the ``AttemptQuota`` object (inspect it
+via ``limit``, ``remaining`` and ``acquired``) and is kept separate from
+each call's ``RetryCallState``. Retrying objects created without
+``attempt_quota`` (the default) behave exactly as before.
+
 Contribute
 ----------
 
