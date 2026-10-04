@@ -17,7 +17,7 @@ import typing
 
 from tornado import gen
 
-from tenacity import BaseRetrying, DoAttempt, DoSleep, RetryCallState
+from tenacity import BaseRetrying, DoAttempt, DoSleep, RetryCallState, RetryQuota
 from tenacity._utils import override
 
 if typing.TYPE_CHECKING:
@@ -32,9 +32,10 @@ class TornadoRetrying(BaseRetrying):
     def __init__(
         self,
         sleep: "typing.Callable[[float], Future[None]]" = gen.sleep,
+        retry_quota: "RetryQuota | None" = None,
         **kwargs: typing.Any,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(retry_quota=retry_quota, **kwargs)
         self.sleep = sleep
 
     @gen.coroutine

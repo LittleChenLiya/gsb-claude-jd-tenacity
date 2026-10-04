@@ -27,6 +27,7 @@ from tenacity import (
     DoSleep,
     RetryCallState,
     RetryError,
+    RetryQuota,
     _RetryDecorated,
     _utils,
     after_nothing,
@@ -93,6 +94,7 @@ class AsyncRetrying(BaseRetrying):
         | None = None,
         name: str | None = None,
         enabled: bool = True,
+        retry_quota: "RetryQuota | None" = None,
     ) -> None:
         super().__init__(
             sleep=sleep,  # type: ignore[arg-type]
@@ -107,6 +109,7 @@ class AsyncRetrying(BaseRetrying):
             retry_error_callback=retry_error_callback,
             name=name,
             enabled=enabled,
+            retry_quota=retry_quota,
         )
 
     @override
@@ -143,6 +146,20 @@ class AsyncRetrying(BaseRetrying):
     @override
     def _add_action_func(self, fn: t.Callable[..., t.Any]) -> None:
         self.iter_state.actions.append(_utils.wrap_to_async_func(fn))
+
+    @override
+    async def _claim_quota(self, retry_state: "RetryCallState") -> None:  # type: ignore[override]
+        """Async claim.
+
+        Awaits the quota's barrier (if set) before the atomic claim, so
+        cancellation before the claim does not consume quota. Once the
+        atomic claim succeeds, the quota is consumed even if the call is
+        cancelled afterwards.
+        """
+        quota = self.retry_quota
+        if quota is None:
+            return
+        await quota.claim_or_raise_async(retry_state.attempt_number)
 
     @override
     async def _run_retry(self, retry_state: "RetryCallState") -> None:  # type: ignore[override]

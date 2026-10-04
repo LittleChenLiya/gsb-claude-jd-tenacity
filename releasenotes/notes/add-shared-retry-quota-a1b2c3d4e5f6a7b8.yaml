@@ -1,0 +1,12 @@
+---
+features:
+  - |
+    Added ``RetryQuota``, a shared attempt quota for concurrent retries. A
+    ``RetryQuota`` is a fixed budget of actual function executions shared
+    across every retrying call that references it. Each attempt atomically
+    claims one quota before the target function runs; failures consume quota
+    too. When the quota is exhausted, ``RetryQuotaExceeded`` is raised
+    immediately, terminating the retry loop without running the ``before``
+    callback or the target function. The quota state is separate from any
+    ``RetryCallState`` and is shared across sync, async, and mixed retries.
+    The quota does not replenish or reset on its own.
