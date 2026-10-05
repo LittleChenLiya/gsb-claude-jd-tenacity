@@ -20,6 +20,21 @@ Retry Main API
 .. autoclass:: tenacity.RetryCallState
    :members:
 
+Attempt Observer
+----------------
+
+.. automodule:: tenacity.observer
+   :members:
+
+.. autoclass:: tenacity.AttemptObserver
+   :members:
+
+.. autoclass:: tenacity.Event
+   :members:
+
+.. autoclass:: tenacity.EventType
+   :members:
+
 After Functions
 ---------------
 

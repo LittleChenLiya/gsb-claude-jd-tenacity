@@ -17,6 +17,7 @@ import typing
 
 from tornado import gen
 
+import tenacity
 from tenacity import BaseRetrying, DoAttempt, DoSleep, RetryCallState
 from tenacity._utils import override
 
@@ -48,17 +49,27 @@ class TornadoRetrying(BaseRetrying):
         self.begin()
 
         retry_state = RetryCallState(retry_object=self, fn=fn, args=args, kwargs=kwargs)
-        while True:
-            do = self.iter(retry_state=retry_state)
-            if isinstance(do, DoAttempt):
-                try:
-                    result = yield fn(*args, **kwargs)
-                except BaseException:
-                    retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+        call_id = self._observe_begin()
+        closing = tenacity.EventType.CALL_END
+        try:
+            while True:
+                do = self.iter(retry_state=retry_state)
+                if isinstance(do, DoAttempt):
+                    self._observe(tenacity.EventType.ATTEMPT_START)
+                    try:
+                        result = yield fn(*args, **kwargs)
+                    except BaseException:
+                        retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+                        self._observe(tenacity.EventType.ATTEMPT_RESULT)
+                    else:
+                        retry_state.set_result(result)
+                        self._observe(tenacity.EventType.ATTEMPT_RESULT)
+                elif isinstance(do, DoSleep):
+                    self._observe(tenacity.EventType.WAIT_START)
+                    retry_state.prepare_for_next_attempt()
+                    yield self.sleep(do)
+                    self._observe(tenacity.EventType.WAIT_END)
                 else:
-                    retry_state.set_result(result)
-            elif isinstance(do, DoSleep):
-                retry_state.prepare_for_next_attempt()
-                yield self.sleep(do)
-            else:
-                raise gen.Return(do)
+                    raise gen.Return(do)
+        finally:
+            self._observe_end(call_id, closing)

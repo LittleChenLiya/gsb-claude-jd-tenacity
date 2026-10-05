@@ -15,6 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import dataclasses
 import functools
 import sys
@@ -39,6 +40,9 @@ from .before_sleep import before_sleep_log, before_sleep_nothing
 
 # Import all nap strategies for easier usage.
 from .nap import sleep, sleep_using_event
+
+# Import the explicit attempt observer.
+from .observer import AttemptObserver, Event, EventType
 
 # Import all built-in retry strategies for easier usage.
 from .retry import (
@@ -261,6 +265,7 @@ class BaseRetrying(ABC):
         retry_error_callback: t.Callable[["RetryCallState"], t.Any] | None = None,
         name: str | None = None,
         enabled: bool = True,
+        observer: "AttemptObserver | None" = None,
     ) -> None:
         self.sleep = sleep
         self.stop = stop
@@ -275,6 +280,7 @@ class BaseRetrying(ABC):
         self.retry_error_callback = retry_error_callback
         self._name = name
         self.enabled = enabled
+        self.observer = observer
 
     def copy(
         self,
@@ -292,6 +298,7 @@ class BaseRetrying(ABC):
         | None = _unset,
         name: str | object | None = _unset,
         enabled: bool | object = _unset,
+        observer: "AttemptObserver | object | None" = _unset,
     ) -> "Self":
         """Copy this object with some parameters changed if needed."""
         return self.__class__(
@@ -309,6 +316,7 @@ class BaseRetrying(ABC):
             ),
             name=_first_set(name, self._name),
             enabled=_first_set(enabled, self.enabled),
+            observer=_first_set(observer, self.observer),
         )
 
     # No @override: object.__getstate__ only exists from Python 3.11 on.
@@ -414,6 +422,56 @@ class BaseRetrying(ABC):
     def _add_action_func(self, fn: t.Callable[..., t.Any]) -> None:
         self.iter_state.actions.append(fn)
 
+    # -- Observer helpers -------------------------------------------------
+    # The observer is a passive sink: it only ever receives an EventType and
+    # a timestamp, and any exception it raises is swallowed so it can never
+    # change the business return value, the raised RetryError, or reraise.
+
+    def _observe_begin(self) -> int | None:
+        observer = self.observer
+        if observer is None:
+            return None
+        try:
+            return observer.begin_call()
+        except Exception:
+            return None
+
+    def _observe_end(
+        self, call_id: int | None, event_type: EventType = EventType.CALL_END
+    ) -> None:
+        observer = self.observer
+        if observer is None or call_id is None:
+            return
+        with contextlib.suppress(Exception):
+            observer.end_call(call_id, event_type)
+
+    def _observe(self, event_type: EventType, timestamp: float | None = None) -> None:
+        observer = self.observer
+        if observer is None:
+            return
+        with contextlib.suppress(Exception):
+            observer.event(event_type, timestamp)
+
+    @staticmethod
+    def _cancellation_event(
+        exc: BaseException,
+    ) -> EventType | None:
+        """Return the closing event type if ``exc`` is a cancellation."""
+        # asyncio.CancelledError is the common case; import lazily to avoid
+        # paying the asyncio import cost on the sync path.
+        try:
+            import asyncio
+        except ImportError:  # pragma: no cover
+            asyncio = None  # type: ignore[assignment]
+        if asyncio is not None and isinstance(exc, asyncio.CancelledError):
+            return EventType.CANCELLED_DURING_ATTEMPT
+        if "trio" in sys.modules:
+            import trio
+
+            if isinstance(exc, trio.Cancelled):
+                return EventType.CANCELLED_DURING_ATTEMPT
+        return None
+
     def _run_retry(self, retry_state: "RetryCallState") -> None:
         self.iter_state.retry_run_result = self.retry(retry_state)
 
@@ -430,6 +488,7 @@ class BaseRetrying(ABC):
     def _run_stop(self, retry_state: "RetryCallState") -> None:
         self.statistics["delay_since_first_attempt"] = retry_state.seconds_since_start
         self.iter_state.stop_run_result = self.stop(retry_state)
+        self._observe(EventType.STOP_DECISION)
 
     def iter(self, retry_state: "RetryCallState") -> DoAttempt | DoSleep | t.Any:
         self._begin_iter(retry_state)
@@ -508,15 +567,39 @@ class BaseRetrying(ABC):
         self.begin()
 
         retry_state = RetryCallState(self, fn=None, args=(), kwargs={})
-        while True:
-            do = self.iter(retry_state=retry_state)
-            if isinstance(do, DoAttempt):
-                yield AttemptManager(retry_state=retry_state)
-            elif isinstance(do, DoSleep):
-                retry_state.prepare_for_next_attempt()
-                self.sleep(do)
-            else:
-                break
+        call_id = self._observe_begin()
+        closing = EventType.CALL_END
+        try:
+            while True:
+                do = self.iter(retry_state=retry_state)
+                if isinstance(do, DoAttempt):
+                    self._observe(EventType.ATTEMPT_START)
+                    yield AttemptManager(retry_state=retry_state)
+                    # The caller's ``with`` block has now run; its outcome is
+                    # set in ``retry_state``.
+                    outcome = retry_state.outcome
+                    if outcome is not None and outcome.failed:
+                        exc = outcome.exception()
+                        if exc is not None:
+                            cancelled = self._cancellation_event(exc)
+                            if cancelled is not None:
+                                closing = cancelled
+                    self._observe(EventType.ATTEMPT_RESULT)
+                elif isinstance(do, DoSleep):
+                    self._observe(EventType.WAIT_START)
+                    retry_state.prepare_for_next_attempt()
+                    try:
+                        self.sleep(do)
+                    except BaseException as exc:
+                        cancelled = self._cancellation_event(exc)
+                        if cancelled is not None:
+                            closing = EventType.CANCELLED_DURING_WAIT
+                        raise
+                    self._observe(EventType.WAIT_END)
+                else:
+                    break
+        finally:
+            self._observe_end(call_id, closing)
 
     @abstractmethod
     def __call__(
@@ -544,20 +627,42 @@ class Retrying(BaseRetrying):
         self.begin()
 
         retry_state = RetryCallState(retry_object=self, fn=fn, args=args, kwargs=kwargs)
-        while True:
-            do = self.iter(retry_state=retry_state)
-            if isinstance(do, DoAttempt):
-                try:
-                    result = fn(*args, **kwargs)
-                except BaseException:
-                    retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+        call_id = self._observe_begin()
+        closing = EventType.CALL_END
+        try:
+            while True:
+                do = self.iter(retry_state=retry_state)
+                if isinstance(do, DoAttempt):
+                    self._observe(EventType.ATTEMPT_START)
+                    try:
+                        result = fn(*args, **kwargs)
+                    except BaseException:
+                        retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+                        self._observe(EventType.ATTEMPT_RESULT)
+                        exc = sys.exc_info()[1]
+                        if exc is not None:
+                            cancelled = self._cancellation_event(exc)
+                            if cancelled is not None:
+                                closing = cancelled
+                    else:
+                        retry_state.set_result(result)
+                        self._observe(EventType.ATTEMPT_RESULT)
+                elif isinstance(do, DoSleep):
+                    self._observe(EventType.WAIT_START)
+                    retry_state.prepare_for_next_attempt()
+                    try:
+                        self.sleep(do)
+                    except BaseException as exc:
+                        if isinstance(exc, BaseException):
+                            cancelled = self._cancellation_event(exc)
+                            if cancelled is not None:
+                                closing = EventType.CANCELLED_DURING_WAIT
+                        raise
+                    self._observe(EventType.WAIT_END)
                 else:
-                    retry_state.set_result(result)
-            elif isinstance(do, DoSleep):
-                retry_state.prepare_for_next_attempt()
-                self.sleep(do)
-            else:
-                return do  # type: ignore[no-any-return]
+                    return do  # type: ignore[no-any-return]
+        finally:
+            self._observe_end(call_id, closing)
 
 
 class Future(futures.Future[t.Any]):
@@ -747,6 +852,7 @@ def retry(
     retry_error_callback: t.Callable[["RetryCallState"], t.Any | t.Awaitable[t.Any]]
     | None = ...,
     enabled: bool = ...,
+    observer: "AttemptObserver | None" = ...,
 ) -> _AsyncRetryDecorator: ...
 
 
@@ -765,6 +871,7 @@ def retry(
     retry_error_callback: t.Callable[["RetryCallState"], t.Any | t.Awaitable[t.Any]]
     | None = None,
     enabled: bool = True,
+    observer: "AttemptObserver | None" = None,
 ) -> t.Callable[[t.Callable[P, R]], _RetryDecorated[P, R]]: ...
 
 
@@ -815,10 +922,13 @@ __all__ = [
     "NO_RESULT",
     "AsyncRetrying",
     "AttemptManager",
+    "AttemptObserver",
     "BaseAction",
     "BaseRetrying",
     "DoAttempt",
     "DoSleep",
+    "Event",
+    "EventType",
     "Future",
     "RetryAction",
     "RetryCallState",

@@ -93,6 +93,7 @@ class AsyncRetrying(BaseRetrying):
         | None = None,
         name: str | None = None,
         enabled: bool = True,
+        observer: "tenacity.AttemptObserver | None" = None,
     ) -> None:
         super().__init__(
             sleep=sleep,  # type: ignore[arg-type]
@@ -107,6 +108,7 @@ class AsyncRetrying(BaseRetrying):
             retry_error_callback=retry_error_callback,
             name=name,
             enabled=enabled,
+            observer=observer,
         )
 
     @override
@@ -122,23 +124,44 @@ class AsyncRetrying(BaseRetrying):
         self.begin()
 
         retry_state = RetryCallState(retry_object=self, fn=fn, args=args, kwargs=kwargs)
-        while True:
-            do = await self.iter(retry_state=retry_state)
-            if isinstance(do, DoAttempt):
-                try:
-                    if is_async:
-                        result = await fn(*args, **kwargs)
+        call_id = self._observe_begin()
+        closing = tenacity.EventType.CALL_END
+        try:
+            while True:
+                do = await self.iter(retry_state=retry_state)
+                if isinstance(do, DoAttempt):
+                    self._observe(tenacity.EventType.ATTEMPT_START)
+                    try:
+                        if is_async:
+                            result = await fn(*args, **kwargs)
+                        else:
+                            result = fn(*args, **kwargs)
+                    except BaseException:
+                        retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+                        self._observe(tenacity.EventType.ATTEMPT_RESULT)
+                        exc = sys.exc_info()[1]
+                        if exc is not None:
+                            cancelled = self._cancellation_event(exc)
+                            if cancelled is not None:
+                                closing = cancelled
                     else:
-                        result = fn(*args, **kwargs)
-                except BaseException:
-                    retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
+                        retry_state.set_result(result)
+                        self._observe(tenacity.EventType.ATTEMPT_RESULT)
+                elif isinstance(do, DoSleep):
+                    self._observe(tenacity.EventType.WAIT_START)
+                    retry_state.prepare_for_next_attempt()
+                    try:
+                        await self.sleep(do)  # type: ignore[misc]
+                    except BaseException as exc:
+                        cancelled = self._cancellation_event(exc)
+                        if cancelled is not None:
+                            closing = tenacity.EventType.CANCELLED_DURING_WAIT
+                        raise
+                    self._observe(tenacity.EventType.WAIT_END)
                 else:
-                    retry_state.set_result(result)
-            elif isinstance(do, DoSleep):
-                retry_state.prepare_for_next_attempt()
-                await self.sleep(do)  # type: ignore[misc]
-            else:
-                return do  # type: ignore[no-any-return]
+                    return do  # type: ignore[no-any-return]
+        finally:
+            self._observe_end(call_id, closing)
 
     @override
     def _add_action_func(self, fn: t.Callable[..., t.Any]) -> None:
@@ -167,6 +190,7 @@ class AsyncRetrying(BaseRetrying):
         self.iter_state.stop_run_result = await _utils.wrap_to_async_func(self.stop)(
             retry_state
         )
+        self._observe(tenacity.EventType.STOP_DECISION)
 
     @override
     async def iter(self, retry_state: "RetryCallState") -> DoAttempt | DoSleep | t.Any:
@@ -188,6 +212,8 @@ class AsyncRetrying(BaseRetrying):
 
         self.begin()
         self._retry_state = RetryCallState(self, fn=None, args=(), kwargs={})
+        self._observer_call_id = self._observe_begin()
+        self._observer_closing = tenacity.EventType.CALL_END
         return self
 
     async def __anext__(self) -> AttemptManager:
@@ -200,16 +226,42 @@ class AsyncRetrying(BaseRetrying):
             self._disabled_iter_done = True
             return AttemptManager(retry_state=self._retry_state)
 
+        # If we previously yielded an AttemptManager, the caller's
+        # ``async with`` block has now run and its outcome is set.
+        if self._retry_state.outcome is not None:
+            outcome = self._retry_state.outcome
+            if outcome.failed:
+                exc = outcome.exception()
+                if exc is not None:
+                    cancelled = self._cancellation_event(exc)
+                    if cancelled is not None:
+                        self._observer_closing = cancelled
+            self._observe(tenacity.EventType.ATTEMPT_RESULT)
+
         while True:
             do = await self.iter(retry_state=self._retry_state)
             if do is None:
+                self._observe_end(self._observer_call_id, self._observer_closing)
                 raise StopAsyncIteration
             if isinstance(do, DoAttempt):
+                self._observe(tenacity.EventType.ATTEMPT_START)
                 return AttemptManager(retry_state=self._retry_state)
             if isinstance(do, DoSleep):
+                self._observe(tenacity.EventType.WAIT_START)
                 self._retry_state.prepare_for_next_attempt()
-                await self.sleep(do)  # type: ignore[misc]
+                try:
+                    await self.sleep(do)  # type: ignore[misc]
+                except BaseException as exc:
+                    cancelled = self._cancellation_event(exc)
+                    if cancelled is not None:
+                        self._observer_closing = (
+                            tenacity.EventType.CANCELLED_DURING_WAIT
+                        )
+                    self._observe_end(self._observer_call_id, self._observer_closing)
+                    raise
+                self._observe(tenacity.EventType.WAIT_END)
             else:
+                self._observe_end(self._observer_call_id, self._observer_closing)
                 raise StopAsyncIteration
 
     @override
