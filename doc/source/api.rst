@@ -20,6 +20,15 @@ Retry Main API
 .. autoclass:: tenacity.RetryCallState
    :members:
 
+Attempt Observer Events
+-----------------------
+
+Those events are reported to the callable passed as the `attempt_observer`
+keyword argument of :py:func:`tenacity.retry`.
+
+.. automodule:: tenacity.observer
+   :members:
+
 After Functions
 ---------------
 

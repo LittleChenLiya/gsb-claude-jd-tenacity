@@ -1,0 +1,13 @@
+---
+features:
+  - |
+    Add an explicit attempt observer (``attempt_observer=``) to ``retry``,
+    ``Retrying``, and ``AsyncRetrying``. The observer receives
+    ``AttemptEvent`` objects -- attempt start, attempt result, stop
+    decision, wait start and wait end, a closing ``CALL_END`` for every
+    terminal outcome (including final success), and cancellation events
+    naming the exact phase -- correlated by ``call_id`` across the
+    synchronous and asynchronous paths. Observers only ever see the event
+    type and its timestamp, observer failures never change the business
+    result, ``RetryError``, or ``reraise`` behaviour, and concurrent calls
+    get isolated event streams.

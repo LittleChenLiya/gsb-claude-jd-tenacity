@@ -21,6 +21,7 @@ import typing as t
 
 import tenacity
 from tenacity import (
+    AttemptEventType,
     AttemptManager,
     BaseRetrying,
     DoAttempt,
@@ -33,6 +34,7 @@ from tenacity import (
     before_nothing,
 )
 from tenacity._utils import override
+from tenacity.observer import AttemptObserver, is_cancellation
 
 # Import all built-in retry strategies for easier usage.
 from .retry import (
@@ -93,6 +95,7 @@ class AsyncRetrying(BaseRetrying):
         | None = None,
         name: str | None = None,
         enabled: bool = True,
+        attempt_observer: AttemptObserver | None = None,
     ) -> None:
         super().__init__(
             sleep=sleep,  # type: ignore[arg-type]
@@ -107,6 +110,7 @@ class AsyncRetrying(BaseRetrying):
             retry_error_callback=retry_error_callback,
             name=name,
             enabled=enabled,
+            attempt_observer=attempt_observer,
         )
 
     @override
@@ -123,22 +127,55 @@ class AsyncRetrying(BaseRetrying):
 
         retry_state = RetryCallState(retry_object=self, fn=fn, args=args, kwargs=kwargs)
         while True:
-            do = await self.iter(retry_state=retry_state)
+            try:
+                do = await self.iter(retry_state=retry_state)
+            except BaseException:
+                # The retry pipeline bailed out (RetryError, reraise, ...):
+                # close the event stream before propagating.
+                self._emit_attempt_event(retry_state.call_id, AttemptEventType.CALL_END)
+                raise
             if isinstance(do, DoAttempt):
+                self._emit_attempt_event(
+                    retry_state.call_id, AttemptEventType.ATTEMPT_START
+                )
                 try:
                     if is_async:
                         result = await fn(*args, **kwargs)
                     else:
                         result = fn(*args, **kwargs)
-                except BaseException:
+                except BaseException as exc:
+                    if is_cancellation(exc):
+                        self._emit_attempt_event(
+                            retry_state.call_id,
+                            AttemptEventType.CANCELLED_DURING_ATTEMPT,
+                        )
                     retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
                 else:
                     retry_state.set_result(result)
             elif isinstance(do, DoSleep):
                 retry_state.prepare_for_next_attempt()
-                await self.sleep(do)  # type: ignore[misc]
+                await self._async_sleep_with_events(retry_state, do)
             else:
+                self._emit_attempt_event(retry_state.call_id, AttemptEventType.CALL_END)
                 return do  # type: ignore[no-any-return]
+
+    async def _async_sleep_with_events(
+        self, retry_state: "RetryCallState", do: float
+    ) -> None:
+        """Async variant of ``_sleep_with_events`` (see BaseRetrying)."""
+        call_id = retry_state.call_id
+        self._emit_attempt_event(call_id, AttemptEventType.WAIT_START)
+        try:
+            await self.sleep(do)  # type: ignore[misc]
+        except BaseException as exc:
+            if is_cancellation(exc):
+                self._emit_attempt_event(
+                    call_id, AttemptEventType.CANCELLED_DURING_WAIT
+                )
+            # The wait never completed, so the call ends here.
+            self._emit_attempt_event(call_id, AttemptEventType.CALL_END)
+            raise
+        self._emit_attempt_event(call_id, AttemptEventType.WAIT_END)
 
     @override
     def _add_action_func(self, fn: t.Callable[..., t.Any]) -> None:
@@ -201,15 +238,29 @@ class AsyncRetrying(BaseRetrying):
             return AttemptManager(retry_state=self._retry_state)
 
         while True:
-            do = await self.iter(retry_state=self._retry_state)
+            try:
+                do = await self.iter(retry_state=self._retry_state)
+            except BaseException:
+                # The retry pipeline bailed out (RetryError, reraise, ...):
+                # close the event stream before propagating.
+                self._emit_attempt_event(
+                    self._retry_state.call_id, AttemptEventType.CALL_END
+                )
+                raise
             if do is None:
+                self._emit_attempt_event(
+                    self._retry_state.call_id, AttemptEventType.CALL_END
+                )
                 raise StopAsyncIteration
             if isinstance(do, DoAttempt):
                 return AttemptManager(retry_state=self._retry_state)
             if isinstance(do, DoSleep):
                 self._retry_state.prepare_for_next_attempt()
-                await self.sleep(do)  # type: ignore[misc]
+                await self._async_sleep_with_events(self._retry_state, do)
             else:
+                self._emit_attempt_event(
+                    self._retry_state.call_id, AttemptEventType.CALL_END
+                )
                 raise StopAsyncIteration
 
     @override

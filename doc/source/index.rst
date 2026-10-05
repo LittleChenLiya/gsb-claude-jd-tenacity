@@ -52,6 +52,7 @@ occurs until a value is returned.
 
     changelog
     api
+    attempt_observer
 
 
 Features

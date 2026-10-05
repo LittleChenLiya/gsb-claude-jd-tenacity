@@ -17,8 +17,15 @@ import typing
 
 from tornado import gen
 
-from tenacity import BaseRetrying, DoAttempt, DoSleep, RetryCallState
+from tenacity import (
+    AttemptEventType,
+    BaseRetrying,
+    DoAttempt,
+    DoSleep,
+    RetryCallState,
+)
 from tenacity._utils import override
+from tenacity.observer import is_cancellation
 
 if typing.TYPE_CHECKING:
     from tornado.concurrent import Future
@@ -49,16 +56,47 @@ class TornadoRetrying(BaseRetrying):
 
         retry_state = RetryCallState(retry_object=self, fn=fn, args=args, kwargs=kwargs)
         while True:
-            do = self.iter(retry_state=retry_state)
+            try:
+                do = self.iter(retry_state=retry_state)
+            except BaseException:
+                # The retry pipeline bailed out (RetryError, reraise, ...):
+                # close the event stream before propagating.
+                self._emit_attempt_event(retry_state.call_id, AttemptEventType.CALL_END)
+                raise
             if isinstance(do, DoAttempt):
+                self._emit_attempt_event(
+                    retry_state.call_id, AttemptEventType.ATTEMPT_START
+                )
                 try:
                     result = yield fn(*args, **kwargs)
-                except BaseException:
+                except BaseException as exc:
+                    if is_cancellation(exc):
+                        self._emit_attempt_event(
+                            retry_state.call_id,
+                            AttemptEventType.CANCELLED_DURING_ATTEMPT,
+                        )
                     retry_state.set_exception(sys.exc_info())  # type: ignore[arg-type]
                 else:
                     retry_state.set_result(result)
             elif isinstance(do, DoSleep):
                 retry_state.prepare_for_next_attempt()
-                yield self.sleep(do)
+                self._emit_attempt_event(
+                    retry_state.call_id, AttemptEventType.WAIT_START
+                )
+                try:
+                    yield self.sleep(do)
+                except BaseException as exc:
+                    if is_cancellation(exc):
+                        self._emit_attempt_event(
+                            retry_state.call_id,
+                            AttemptEventType.CANCELLED_DURING_WAIT,
+                        )
+                    # The wait never completed, so the call ends here.
+                    self._emit_attempt_event(
+                        retry_state.call_id, AttemptEventType.CALL_END
+                    )
+                    raise
+                self._emit_attempt_event(retry_state.call_id, AttemptEventType.WAIT_END)
             else:
+                self._emit_attempt_event(retry_state.call_id, AttemptEventType.CALL_END)
                 raise gen.Return(do)
