@@ -253,12 +253,68 @@ See also these methods:
     retry_if_exception_type
     retry_if_not_exception_type
     retry_unless_exception_type
+    retry_if_exception_group
     retry_if_result
     retry_if_not_result
     retry_if_exception_message
     retry_if_not_exception_message
     retry_any
     retry_all
+
+Retrying on exception groups
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the code you retry raises an :class:`ExceptionGroup` (or a
+:class:`BaseExceptionGroup`), ``retry_if_exception_group`` evaluates every
+real leaf exception instead of looking at the group object itself. Nested
+groups are flattened and each leaf keeps the path of group indexes that led
+to it, so the exact position of every leaf is known:
+
+.. testcode::
+
+    from tenacity import retry_if_exception_group
+
+    class TransientError(Exception):
+        pass
+
+    class FatalError(Exception):
+        pass
+
+    group = ExceptionGroup(
+        "outer",
+        [
+            ExceptionGroup("inner", [TransientError(), FatalError()]),
+        ],
+    )
+
+    # Retry as soon as one leaf is retryable:
+    retry_if_exception_group(lambda e: isinstance(e, TransientError), mode="any")
+
+    # Only retry when every leaf is retryable:
+    retry_if_exception_group(lambda e: isinstance(e, TransientError), mode="all")
+
+The rules are explicit and safe:
+
+* **any / all** -- ``mode="any"`` retries if at least one leaf matches,
+  ``mode="all"`` only retries when every leaf matches.
+* **Each leaf predicate runs once** -- a leaf appearing more than once in the
+  group is only evaluated a single time.
+* **Cancellation and system termination are never retried** -- a leaf that is
+  a cancellation (``asyncio.CancelledError``), ``KeyboardInterrupt``,
+  ``SystemExit`` or ``GeneratorExit`` vetoes the retry: the business predicate
+  is not even consulted for any leaf and the exception propagates. The set of
+  fatal types can be changed with the ``fatal_exceptions`` argument.
+* **Unknown chains refuse to judge** -- the predicate is explicit about the
+  chain it understands: if the raised exception is not an exception group,
+  :class:`tenacity.NotAnExceptionGroup` is raised instead of guessing.
+* **Predicate failures are not faked as ``False``** -- if the predicate itself
+  raises, the exception propagates; it is never swallowed into a retry
+  decision.
+* **The result explains which leaf decided** -- after each call, the
+  ``last_decision`` attribute holds an :class:`tenacity.ExceptionGroupDecision`
+  describing every leaf (its path, its exception and the predicate result),
+  along with the ``matched``, ``rejected`` and ``fatal_leaves`` that explain
+  the decision.
 
 We can also combine several conditions:
 

@@ -42,12 +42,17 @@ from .nap import sleep, sleep_using_event
 
 # Import all built-in retry strategies for easier usage.
 from .retry import (
+    DEFAULT_FATAL_EXCEPTIONS,
+    ExceptionGroupDecision,
+    ExceptionGroupLeaf,
+    NotAnExceptionGroup,
     retry_all,
     retry_always,
     retry_any,
     retry_base,
     retry_if_exception,
     retry_if_exception_cause_type,
+    retry_if_exception_group,
     retry_if_exception_message,
     retry_if_exception_type,
     retry_if_not_exception_message,
@@ -812,6 +817,7 @@ if _has_tornado():
 
 
 __all__ = [
+    "DEFAULT_FATAL_EXCEPTIONS",
     "NO_RESULT",
     "AsyncRetrying",
     "AttemptManager",
@@ -819,7 +825,10 @@ __all__ = [
     "BaseRetrying",
     "DoAttempt",
     "DoSleep",
+    "ExceptionGroupDecision",
+    "ExceptionGroupLeaf",
     "Future",
+    "NotAnExceptionGroup",
     "RetryAction",
     "RetryCallState",
     "RetryError",
@@ -839,6 +848,7 @@ __all__ = [
     "retry_base",
     "retry_if_exception",
     "retry_if_exception_cause_type",
+    "retry_if_exception_group",
     "retry_if_exception_message",
     "retry_if_exception_type",
     "retry_if_not_exception_message",

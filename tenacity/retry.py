@@ -15,6 +15,9 @@
 # limitations under the License.
 
 import abc
+import asyncio
+import builtins
+import dataclasses
 import re
 import typing
 
@@ -22,6 +25,14 @@ from tenacity._utils import override
 
 if typing.TYPE_CHECKING:
     from tenacity import RetryCallState
+
+# Exception groups are a Python 3.11 feature; on older interpreters use the
+# ``exceptiongroup`` backport when it is available. When neither is available
+# the predicate refuses to judge rather than guessing.
+try:
+    from exceptiongroup import BaseExceptionGroup  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    BaseExceptionGroup = getattr(builtins, "BaseExceptionGroup", None)  # type: ignore[assignment]
 
 
 class retry_base(abc.ABC):
@@ -313,3 +324,202 @@ class retry_all(retry_base):
         if isinstance(other, retry_all):
             return retry_all(*other.retries, *self.retries)
         return retry_all(other, *self.retries)
+
+
+#: Exceptions that represent cancellation or interpreter/system shutdown and
+#: that business retry rules must never be able to turn into a retry.
+DEFAULT_FATAL_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    asyncio.CancelledError,
+    KeyboardInterrupt,
+    SystemExit,
+    GeneratorExit,
+)
+
+
+class NotAnExceptionGroup(TypeError):
+    """Raised when a retry predicate is asked to judge an exception that is
+    not an :class:`ExceptionGroup` (or :class:`BaseExceptionGroup`).
+
+    The group predicates are explicit about the chain they understand: rather
+    than guessing on an unknown exception chain, they refuse to judge.
+    """
+
+
+@dataclasses.dataclass(frozen=True)
+class ExceptionGroupLeaf:
+    """A single leaf of an exception group as evaluated by
+    :class:`retry_if_exception_group`.
+
+    :param path: indexes of the nested groups that lead to this leaf
+    :param exception: the real leaf exception
+    :param result: the predicate result for this leaf, or ``None`` when the
+        predicate was not consulted because the leaf is a fatal/system exception
+    :param fatal: whether this leaf is a fatal/system exception that vetoed
+        the retry without the predicate being consulted
+    """
+
+    path: tuple[int, ...]
+    exception: BaseException
+    result: bool | None
+    fatal: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class ExceptionGroupDecision:
+    """Explanation of a :class:`retry_if_exception_group` decision.
+
+    :param retry: whether the group should be retried
+    :param mode: ``"any"`` or ``"all"``
+    :param fatal: whether a fatal/system leaf vetoed the retry
+    :param leaves: every leaf, with the result of the predicate for each
+    """
+
+    retry: bool
+    mode: str
+    fatal: bool
+    leaves: tuple[ExceptionGroupLeaf, ...]
+
+    @property
+    def matched(self) -> tuple[ExceptionGroupLeaf, ...]:
+        """Leaves for which the predicate returned ``True``."""
+        return tuple(leaf for leaf in self.leaves if leaf.result is True)
+
+    @property
+    def rejected(self) -> tuple[ExceptionGroupLeaf, ...]:
+        """Leaves for which the predicate returned ``False``."""
+        return tuple(leaf for leaf in self.leaves if leaf.result is False)
+
+    @property
+    def fatal_leaves(self) -> tuple[ExceptionGroupLeaf, ...]:
+        """Fatal/system leaves that were not submitted to the predicate."""
+        return tuple(leaf for leaf in self.leaves if leaf.fatal)
+
+
+def _iter_group_leaves(
+    exception: BaseExceptionGroup,
+    path: tuple[int, ...] = (),
+) -> typing.Iterator[tuple[tuple[int, ...], BaseException]]:
+    """Yield ``(path, leaf_exception)`` for every leaf of an exception group.
+
+    Nested groups are flattened in order; the path records the index of each
+    nested group on the way to the leaf, so the exact position of every leaf
+    in the original group is preserved.
+    """
+    for index, sub in enumerate(exception.exceptions):
+        sub_path = (*path, index)
+        if isinstance(sub, BaseExceptionGroup):
+            yield from _iter_group_leaves(sub, sub_path)
+        else:
+            yield sub_path, sub
+
+
+class retry_if_exception_group(retry_base):
+    """Retry strategy that evaluates the real leaves of an exception group.
+
+    The predicate is called once per leaf exception (a leaf appearing more
+    than once in the group is only evaluated a single time); nested groups are
+    flattened and each leaf keeps the path of group indexes that led to it.
+
+    :param predicate: callable invoked with each leaf exception; must return
+        a truthy value to request a retry for that leaf
+    :param mode: ``"any"`` to retry as soon as one leaf matches, ``"all"`` to
+        only retry when every leaf matches
+    :param fatal_exceptions: exception types that represent cancellation or
+        system termination; when such a leaf is present the group is never
+        retried and the predicate is not consulted for any leaf
+
+    The predicate is an explicit group predicate: if the raised exception is
+    not a :class:`BaseExceptionGroup`, :class:`NotAnExceptionGroup` is raised
+    instead of guessing. If the predicate itself raises, the exception
+    propagates -- it is never swallowed and turned into a ``False`` decision.
+
+    The latest decision is explained on the :attr:`last_decision` attribute.
+    """
+
+    def __init__(
+        self,
+        predicate: typing.Callable[[BaseException], bool],
+        mode: str = "any",
+        *,
+        fatal_exceptions: tuple[type[BaseException], ...] = DEFAULT_FATAL_EXCEPTIONS,
+    ) -> None:
+        if mode not in ("any", "all"):
+            raise ValueError(
+                f"{self.__class__.__name__}() mode must be 'any' or 'all', got {mode!r}"
+            )
+        self.predicate = predicate
+        self.mode = mode
+        self.fatal_exceptions = fatal_exceptions
+        self.last_decision: ExceptionGroupDecision | None = None
+
+    @override
+    def __call__(self, retry_state: "RetryCallState") -> bool:
+        if retry_state.outcome is None:
+            raise RuntimeError("__call__() called before outcome was set")
+
+        if not retry_state.outcome.failed:
+            return False
+
+        exception = retry_state.outcome.exception()
+        if exception is None:
+            raise RuntimeError("outcome failed but the exception is None")
+
+        if BaseExceptionGroup is None or not isinstance(exception, BaseExceptionGroup):
+            # This predicate is explicit about the chain it understands:
+            # rather than guessing on an unknown exception chain, refuse to
+            # judge.
+            raise NotAnExceptionGroup(
+                f"{self.__class__.__name__}() expects an ExceptionGroup, "
+                f"got {type(exception).__name__}"
+            )
+
+        leaves = tuple(_iter_group_leaves(exception))
+
+        # Cancellation and system-termination exceptions must never be
+        # swallowed into a retry by a business rule: veto without consulting
+        # the predicate for any leaf.
+        if any(
+            isinstance(leaf_exception, self.fatal_exceptions)
+            for _, leaf_exception in leaves
+        ):
+            decision = ExceptionGroupDecision(
+                retry=False,
+                mode=self.mode,
+                fatal=True,
+                leaves=tuple(
+                    ExceptionGroupLeaf(
+                        path,
+                        leaf_exception,
+                        None,
+                        isinstance(leaf_exception, self.fatal_exceptions),
+                    )
+                    for path, leaf_exception in leaves
+                ),
+            )
+            self.last_decision = decision
+            return False
+
+        # Evaluate every leaf exactly once. A leaf object appearing more than
+        # once in the group is only evaluated a single time. A predicate that
+        # raises propagates: its failure must not be faked as a False result.
+        results: dict[int, bool] = {}
+        evaluated: list[ExceptionGroupLeaf] = []
+        for path, leaf_exception in leaves:
+            leaf_id = id(leaf_exception)
+            if leaf_id not in results:
+                results[leaf_id] = self.predicate(leaf_exception)
+            evaluated.append(ExceptionGroupLeaf(path, leaf_exception, results[leaf_id]))
+
+        if self.mode == "any":
+            retry = any(leaf.result for leaf in evaluated)
+        else:
+            retry = all(leaf.result for leaf in evaluated)
+
+        decision = ExceptionGroupDecision(
+            retry=retry,
+            mode=self.mode,
+            fatal=False,
+            leaves=tuple(evaluated),
+        )
+        self.last_decision = decision
+        return retry
