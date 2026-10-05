@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import abc
+import asyncio
+import builtins
 import re
 import typing
 
@@ -22,6 +24,19 @@ from tenacity._utils import override
 
 if typing.TYPE_CHECKING:
     from tenacity import RetryCallState
+
+# ``BaseExceptionGroup`` is a builtin only on Python 3.11+. On 3.10 groups
+# cannot exist at runtime, so the group strategy simply refuses to judge.
+_BaseExceptionGroup: "type[BaseException] | None" = getattr(
+    builtins, "BaseExceptionGroup", None
+)
+
+
+class _ExceptionGroupLike(typing.Protocol):
+    """Structural view of ``BaseExceptionGroup`` for leaf traversal."""
+
+    @property
+    def exceptions(self) -> tuple[BaseException, ...]: ...
 
 
 class retry_base(abc.ABC):
@@ -195,6 +210,198 @@ class retry_if_exception_cause_type(retry_base):
                 exc = exc.__cause__
 
         return False
+
+
+class UndecidableRetryError(RuntimeError):
+    """Raised when a retry strategy explicitly refuses to judge an exception.
+
+    This is never swallowed by tenacity: it propagates out of the retry
+    machinery so that misconfiguration surfaces loudly instead of being
+    silently treated as "do not retry".
+    """
+
+
+class LeafVerdict(typing.NamedTuple):
+    """Outcome of evaluating a single leaf exception of an exception group.
+
+    Attributes:
+        path: Index path of the leaf inside the (possibly nested) group,
+            e.g. ``(1, 0)`` is the first leaf of the second sub-group.
+        exception: The leaf exception instance itself.
+        matched: Result of the leaf predicate, or ``None`` when the
+            predicate was deliberately not run (terminal leaf).
+        terminal: True for cancellation / system-termination leaves
+            (``KeyboardInterrupt``, ``SystemExit``, ``GeneratorExit``,
+            ``asyncio.CancelledError``) which business rules must never
+            swallow into a retry.
+    """
+
+    path: tuple[int, ...]
+    exception: BaseException
+    matched: bool | None
+    terminal: bool
+
+
+class ExceptionGroupRetryReport(typing.NamedTuple):
+    """Explanation of a :class:`retry_if_exception_group` decision.
+
+    Attributes:
+        decision: The boolean returned to the retry machinery.
+        mode: ``"any"`` or ``"all"``.
+        verdicts: One :class:`LeafVerdict` per leaf, in traversal order.
+        deciding_path: Path of the leaf that determined the decision
+            (first match for ``any``, first non-match for ``all``, first
+            terminal leaf when blocked, last leaf for a fully-matching
+            ``all``); ``None`` when no single leaf decided (e.g. ``any``
+            with no match at all).
+        blocked_paths: Paths of terminal leaves that forced ``decision``
+            to ``False`` regardless of the business predicate.
+    """
+
+    decision: bool
+    mode: str
+    verdicts: tuple[LeafVerdict, ...]
+    deciding_path: tuple[int, ...] | None
+    blocked_paths: tuple[tuple[int, ...], ...]
+
+    @property
+    def explanation(self) -> str:
+        """Human-readable reason naming the leaf that decided."""
+        if self.blocked_paths:
+            return (
+                f"retry denied: terminal leaf at path {self.blocked_paths[0]} "
+                "(cancellation/system-exit exceptions are never retried)"
+            )
+        if self.deciding_path is None:
+            return (
+                f"retry {'allowed' if self.decision else 'denied'}: "
+                f"mode={self.mode!r}, no single deciding leaf "
+                f"({len(self.verdicts)} leaves evaluated)"
+            )
+        verdict = next(v for v in self.verdicts if v.path == self.deciding_path)
+        return (
+            f"retry {'allowed' if self.decision else 'denied'}: "
+            f"mode={self.mode!r}, decided by leaf at path "
+            f"{self.deciding_path} ({type(verdict.exception).__name__}, "
+            f"matched={verdict.matched})"
+        )
+
+
+class retry_if_exception_group(retry_base):
+    """Retries based on the real leaf exceptions of an ``ExceptionGroup``.
+
+    The leaf ``predicate`` is applied to every non-terminal leaf exception
+    of the group (nested groups are flattened, keeping index paths) and the
+    per-leaf booleans are combined with ``mode``:
+
+    - ``mode="any"``: retry if at least one leaf matches;
+    - ``mode="all"``: retry only if every leaf matches.
+
+    Rules (deliberately strict, unlike :class:`retry_if_exception`):
+
+    - The raised exception must be a ``BaseExceptionGroup``; anything else
+      (plain exceptions, unknown cause chains) raises
+      :class:`UndecidableRetryError` instead of guessing.
+    - Terminal leaves (``KeyboardInterrupt``, ``SystemExit``,
+      ``GeneratorExit``, ``asyncio.CancelledError``) are never passed to
+      the business predicate and force the whole decision to ``False``:
+      cancellation and system termination must not be swallowed as retries.
+    - Each leaf predicate runs exactly once per leaf per call.
+    - Exceptions raised by the predicate itself propagate unchanged; they
+      are never converted into a ``False`` ("do not retry") answer.
+    - The decision is explained via :attr:`last_report`, including the
+      index path of the leaf that decided.
+
+    The default :class:`retry_if_exception` behaviour is untouched.
+    """
+
+    TERMINAL_EXCEPTION_TYPES: tuple[type[BaseException], ...] = (
+        KeyboardInterrupt,
+        SystemExit,
+        GeneratorExit,
+        asyncio.CancelledError,
+    )
+
+    def __init__(
+        self,
+        predicate: typing.Callable[[BaseException], bool],
+        mode: str = "any",
+    ) -> None:
+        if mode not in ("any", "all"):
+            raise ValueError(f"mode must be 'any' or 'all', got {mode!r}")
+        self.predicate = predicate
+        self.mode = mode
+        self.last_report: ExceptionGroupRetryReport | None = None
+
+    def _iter_leaves(
+        self,
+        exc: BaseException,
+        path: tuple[int, ...],
+    ) -> typing.Iterator[tuple[tuple[int, ...], BaseException]]:
+        if _BaseExceptionGroup is not None and isinstance(exc, _BaseExceptionGroup):
+            group = typing.cast("_ExceptionGroupLike", exc)
+            for index, sub in enumerate(group.exceptions):
+                yield from self._iter_leaves(sub, (*path, index))
+        else:
+            yield path, exc
+
+    @override
+    def __call__(self, retry_state: "RetryCallState") -> bool:
+        if retry_state.outcome is None:
+            raise RuntimeError("__call__() called before outcome was set")
+
+        if not retry_state.outcome.failed:
+            return False
+
+        exception = retry_state.outcome.exception()
+        if exception is None:
+            raise RuntimeError("outcome failed but the exception is None")
+
+        if _BaseExceptionGroup is None or not isinstance(
+            exception, _BaseExceptionGroup
+        ):
+            raise UndecidableRetryError(
+                f"{self.__class__.__name__} only judges BaseExceptionGroup "
+                f"instances; got {type(exception).__name__}. Use "
+                "retry_if_exception for plain exceptions."
+            )
+
+        verdicts: list[LeafVerdict] = []
+        blocked_paths: list[tuple[int, ...]] = []
+        for path, leaf in self._iter_leaves(exception, ()):
+            if isinstance(leaf, self.TERMINAL_EXCEPTION_TYPES):
+                # Never let business rules see cancellation/system-exit
+                # leaves: they cannot be "retried away".
+                verdicts.append(LeafVerdict(path, leaf, None, terminal=True))
+                blocked_paths.append(path)
+                continue
+            # Predicate errors propagate: a failing predicate must not be
+            # silently read as "do not retry".
+            matched = bool(self.predicate(leaf))
+            verdicts.append(LeafVerdict(path, leaf, matched, terminal=False))
+
+        deciding_path: tuple[int, ...] | None
+        if blocked_paths:
+            decision = False
+            deciding_path = blocked_paths[0]
+        elif self.mode == "any":
+            decision = any(v.matched for v in verdicts)
+            deciding_path = next((v.path for v in verdicts if v.matched), None)
+        else:
+            decision = all(v.matched for v in verdicts)
+            if decision:
+                deciding_path = verdicts[-1].path if verdicts else None
+            else:
+                deciding_path = next((v.path for v in verdicts if not v.matched), None)
+
+        self.last_report = ExceptionGroupRetryReport(
+            decision=decision,
+            mode=self.mode,
+            verdicts=tuple(verdicts),
+            deciding_path=deciding_path,
+            blocked_paths=tuple(blocked_paths),
+        )
+        return decision
 
 
 class retry_if_result(retry_base):

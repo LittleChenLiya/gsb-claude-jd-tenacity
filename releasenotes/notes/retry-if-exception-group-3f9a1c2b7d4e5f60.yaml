@@ -1,0 +1,16 @@
+---
+features:
+  - |
+    Add ``tenacity.retry_if_exception_group``, an explicit retry predicate
+    for ``ExceptionGroup``/``BaseExceptionGroup`` (Python 3.11+). It applies
+    a leaf predicate to the real leaf exceptions of (possibly nested)
+    groups -- keeping each leaf's index path -- and combines the verdicts
+    with ``mode="any"`` or ``mode="all"``. Terminal leaves
+    (``KeyboardInterrupt``, ``SystemExit``, ``GeneratorExit``,
+    ``asyncio.CancelledError``) are never passed to the business predicate
+    and always force "no retry"; non-group exceptions raise
+    ``UndecidableRetryError`` instead of being guessed; predicate errors
+    propagate rather than being read as ``False``. Every decision is
+    explained via ``strategy.last_report`` (``ExceptionGroupRetryReport``
+    of ``LeafVerdict`` entries), including the path of the deciding leaf.
+    The default ``retry_if_exception`` behaviour is unchanged.

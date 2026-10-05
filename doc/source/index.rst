@@ -253,6 +253,7 @@ See also these methods:
     retry_if_exception_type
     retry_if_not_exception_type
     retry_unless_exception_type
+    retry_if_exception_group
     retry_if_result
     retry_if_not_result
     retry_if_exception_message
@@ -274,6 +275,42 @@ We can also combine several conditions:
 
 Any combination of stop, wait, etc. is also supported to give you the freedom
 to mix and match.
+
+Retrying on ``ExceptionGroup`` (Python 3.11+)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``retry_if_exception_group`` judges the *real leaf exceptions* of an
+``ExceptionGroup`` instead of the opaque group object. Nested groups are
+flattened while each leaf keeps its index path (e.g. ``(1, 0)``), and the
+leaf verdicts are combined with ``mode="any"`` (retry if at least one leaf
+matches) or ``mode="all"`` (retry only if every leaf matches):
+
+.. testcode::
+
+    from tenacity import retry_if_exception_group
+
+    @retry(retry=retry_if_exception_group(
+        lambda exc: isinstance(exc, TransientError), mode="any"))
+    def fan_out():
+        ...
+
+The rules are deliberately strict:
+
+- the raised exception must be a ``BaseExceptionGroup``; anything else
+  raises ``UndecidableRetryError`` (unknown cause chains are refused, not
+  guessed);
+- terminal leaves (``KeyboardInterrupt``, ``SystemExit``,
+  ``GeneratorExit``, ``asyncio.CancelledError``) are never passed to the
+  business predicate and force the decision to "no retry" -- cancellation
+  and system termination must not be swallowed as retries;
+- each leaf predicate runs exactly once per leaf, and exceptions raised by
+  the predicate itself propagate instead of being read as ``False``;
+- every decision is explained in ``strategy.last_report`` (an
+  ``ExceptionGroupRetryReport`` of per-leaf ``LeafVerdict`` entries),
+  including the path of the leaf that decided.
+
+The default ``retry_if_exception`` behaviour is unchanged: it still sees
+the group object itself, not the leaves.
 
 It's also possible to retry explicitly at any time by raising the `TryAgain`
 exception:
